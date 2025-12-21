@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/client"
 	"github.com/hostathome/cli/internal/docker"
 	"github.com/hostathome/cli/internal/registry"
+	"github.com/hostathome/cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -13,16 +19,97 @@ var version = "dev"
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
 var rootCmd = &cobra.Command{
-	Use:     "hostathome",
-	Short:   "Manage game servers with ease",
-	Long:    "HostAtHome CLI - Install, run, and manage game servers using Docker.",
+	Use:   "hostathome",
+	Short: "Manage game servers with ease",
+	Long: `HostAtHome CLI - Install, run, and manage game servers using Docker.
+
+Run 'hostathome doctor' to check if your system is ready.
+Run 'hostathome list' to see available games.`,
 	Version: version,
+	SilenceErrors: true,
+	SilenceUsage:  true,
+}
+
+var doctorCmd = &cobra.Command{
+	Use:   "doctor",
+	Short: "Check system requirements",
+	Long:  "Verify that Docker is installed and running, and check system readiness.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ui.Title("HostAtHome Doctor")
+		fmt.Println()
+
+		allGood := true
+
+		// Check Docker installed
+		ui.Step("Checking Docker installation...")
+		_, err := exec.LookPath("docker")
+		if err != nil {
+			ui.Error("Docker not found in PATH")
+			ui.Detail("Fix", "Install Docker: https://docs.docker.com/get-docker/")
+			allGood = false
+		} else {
+			ui.Success("Docker is installed")
+		}
+
+		// Check Docker daemon running
+		ui.Step("Checking Docker daemon...")
+		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if err != nil {
+			ui.Error("Cannot connect to Docker: %v", err)
+			allGood = false
+		} else {
+			defer cli.Close()
+			_, err = cli.Ping(context.Background())
+			if err != nil {
+				ui.Error("Docker daemon not running")
+				ui.Detail("Fix", "Start Docker: sudo systemctl start docker")
+				allGood = false
+			} else {
+				ui.Success("Docker daemon is running")
+			}
+		}
+
+		// Check Docker permissions
+		ui.Step("Checking Docker permissions...")
+		ctx := context.Background()
+		if cli != nil {
+			_, err = cli.ImageList(ctx, image.ListOptions{})
+			if err != nil {
+				ui.Error("Cannot access Docker (permission denied?)")
+				ui.Detail("Fix", "Add user to docker group: sudo usermod -aG docker $USER")
+				ui.Detail("Note", "Log out and back in after adding to group")
+				allGood = false
+			} else {
+				ui.Success("Docker permissions OK")
+			}
+		}
+
+		// Check registry access
+		ui.Step("Checking registry access...")
+		_, err = registry.ListGames()
+		if err != nil {
+			ui.Warning("Cannot fetch game registry (offline?)")
+			ui.Detail("Note", "CLI will use cached data if available")
+		} else {
+			ui.Success("Registry accessible")
+		}
+
+		fmt.Println()
+		if allGood {
+			ui.Success("All checks passed! You're ready to go.")
+			fmt.Println()
+			ui.Info("Try: hostathome list")
+		} else {
+			ui.Error("Some checks failed. Please fix the issues above.")
+			return fmt.Errorf("system not ready")
+		}
+		return nil
+	},
 }
 
 var installCmd = &cobra.Command{
@@ -35,30 +122,49 @@ var installCmd = &cobra.Command{
 
 		game, err := registry.GetGame(gameName)
 		if err != nil {
+			ui.Error("Game '%s' not found", gameName)
+			ui.Info("Run 'hostathome list' to see available games")
 			return err
 		}
 
-		fmt.Printf("Installing %s...\n", game.DisplayName)
+		ui.Title("Installing %s", game.DisplayName)
+		fmt.Println()
 
 		// Pull Docker image
+		spinner := ui.NewSpinner(fmt.Sprintf("Pulling %s", game.Image))
+		spinner.Start()
 		if err := docker.PullImage(game.Image); err != nil {
+			spinner.Stop(false)
 			return fmt.Errorf("failed to pull image: %w", err)
 		}
+		spinner.Stop(true)
 
 		// Create directory structure
+		spinner = ui.NewSpinner("Creating directory structure")
+		spinner.Start()
 		if err := docker.CreateServerDirs(gameName); err != nil {
+			spinner.Stop(false)
 			return fmt.Errorf("failed to create directories: %w", err)
 		}
+		spinner.Stop(true)
 
-		// Copy default config if it doesn't exist
+		// Copy default config
+		spinner = ui.NewSpinner("Writing default configuration")
+		spinner.Start()
 		if err := registry.CopyDefaultConfig(gameName, game); err != nil {
+			spinner.Stop(false)
 			return fmt.Errorf("failed to copy default config: %w", err)
 		}
+		spinner.Stop(true)
 
-		fmt.Printf("%s installed successfully!\n", game.DisplayName)
-		fmt.Printf("  Directory: ./%s-server/\n", gameName)
-		fmt.Printf("  Config:    ./%s-server/configs/config.yaml\n", gameName)
-		fmt.Printf("\nRun with: hostathome run %s\n", gameName)
+		fmt.Println()
+		ui.Success("%s installed successfully!", game.DisplayName)
+		fmt.Println()
+		ui.Detail("Directory", fmt.Sprintf("./%s-server/", gameName))
+		ui.Detail("Config", fmt.Sprintf("./%s-server/configs/config.yaml", gameName))
+		fmt.Println()
+		ui.Info("Start with: hostathome run %s", gameName)
+
 		return nil
 	},
 }
@@ -66,27 +172,37 @@ var installCmd = &cobra.Command{
 var runCmd = &cobra.Command{
 	Use:   "run <game>",
 	Short: "Start a game server",
-	Long:  "Start the game server container (or restart if already running).",
+	Long:  "Start the game server container.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		gameName := args[0]
 
 		game, err := registry.GetGame(gameName)
 		if err != nil {
+			ui.Error("Game '%s' not found", gameName)
 			return err
 		}
 
-		fmt.Printf("Starting %s...\n", game.DisplayName)
+		spinner := ui.NewSpinner(fmt.Sprintf("Starting %s", game.DisplayName))
+		spinner.Start()
 
 		if err := docker.RunContainer(gameName, game); err != nil {
+			spinner.Stop(false)
 			return fmt.Errorf("failed to start container: %w", err)
 		}
+		spinner.Stop(true)
 
-		fmt.Printf("%s is running!\n", game.DisplayName)
-		fmt.Printf("  Player port: %d\n", game.Ports.Player)
+		fmt.Println()
+		ui.Success("%s is running!", game.DisplayName)
+		fmt.Println()
+		ui.Detail("Player port", fmt.Sprintf("%d", game.Ports.Player))
 		if game.Ports.RCON > 0 {
-			fmt.Printf("  RCON port:   %d\n", game.Ports.RCON)
+			ui.Detail("RCON port", fmt.Sprintf("%d", game.Ports.RCON))
 		}
+		fmt.Println()
+		ui.Info("View logs: hostathome logs %s", gameName)
+		ui.Info("Stop: hostathome stop %s", gameName)
+
 		return nil
 	},
 }
@@ -101,24 +217,107 @@ var stopCmd = &cobra.Command{
 
 		game, err := registry.GetGame(gameName)
 		if err != nil {
+			ui.Error("Game '%s' not found", gameName)
 			return err
 		}
 
-		fmt.Printf("Stopping %s...\n", game.DisplayName)
+		spinner := ui.NewSpinner(fmt.Sprintf("Stopping %s", game.DisplayName))
+		spinner.Start()
 
 		if err := docker.StopContainer(gameName); err != nil {
+			spinner.Stop(false)
 			return fmt.Errorf("failed to stop container: %w", err)
 		}
+		spinner.Stop(true)
 
-		fmt.Printf("%s stopped.\n", game.DisplayName)
+		fmt.Println()
+		ui.Success("%s stopped.", game.DisplayName)
+
 		return nil
+	},
+}
+
+var logsCmd = &cobra.Command{
+	Use:   "logs <game>",
+	Short: "View server logs",
+	Long:  "Stream logs from the game server container.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		gameName := args[0]
+		follow, _ := cmd.Flags().GetBool("follow")
+		tail, _ := cmd.Flags().GetString("tail")
+
+		containerName := "hostathome-" + gameName
+
+		cmdArgs := []string{"logs"}
+		if follow {
+			cmdArgs = append(cmdArgs, "-f")
+		}
+		if tail != "" {
+			cmdArgs = append(cmdArgs, "--tail", tail)
+		}
+		cmdArgs = append(cmdArgs, containerName)
+
+		dockerCmd := exec.Command("docker", cmdArgs...)
+		dockerCmd.Stdout = os.Stdout
+		dockerCmd.Stderr = os.Stderr
+
+		return dockerCmd.Run()
+	},
+}
+
+var configCmd = &cobra.Command{
+	Use:   "config <game>",
+	Short: "Edit server configuration",
+	Long:  "Open the server configuration file in your default editor.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		gameName := args[0]
+
+		configPath := filepath.Join(fmt.Sprintf("./%s-server", gameName), "configs", "config.yaml")
+
+		// Check if config exists
+		if _, err := os.Stat(configPath); os.IsNotExist(err) {
+			ui.Error("Config not found: %s", configPath)
+			ui.Info("Run 'hostathome install %s' first", gameName)
+			return err
+		}
+
+		// Get editor from env
+		editor := os.Getenv("EDITOR")
+		if editor == "" {
+			editor = os.Getenv("VISUAL")
+		}
+		if editor == "" {
+			// Try common editors
+			for _, e := range []string{"nano", "vim", "vi"} {
+				if _, err := exec.LookPath(e); err == nil {
+					editor = e
+					break
+				}
+			}
+		}
+		if editor == "" {
+			ui.Error("No editor found")
+			ui.Detail("Fix", "Set EDITOR environment variable")
+			return fmt.Errorf("no editor found")
+		}
+
+		ui.Info("Opening %s with %s...", configPath, editor)
+
+		editorCmd := exec.Command(editor, configPath)
+		editorCmd.Stdin = os.Stdin
+		editorCmd.Stdout = os.Stdout
+		editorCmd.Stderr = os.Stderr
+
+		return editorCmd.Run()
 	},
 }
 
 var statusCmd = &cobra.Command{
 	Use:   "status [game]",
 	Short: "Show server status",
-	Long:  "Show the status of running game servers. Optionally specify a game.",
+	Long:  "Show the status of running game servers.",
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var gameName string
@@ -133,18 +332,32 @@ var statusCmd = &cobra.Command{
 
 		if len(statuses) == 0 {
 			if gameName != "" {
-				fmt.Printf("No container found for %s\n", gameName)
+				ui.Info("No container found for %s", gameName)
 			} else {
-				fmt.Println("No HostAtHome containers running")
+				ui.Info("No HostAtHome containers running")
 			}
+			fmt.Println()
+			ui.Info("Install a game: hostathome install <game>")
+			ui.Info("List games: hostathome list")
 			return nil
 		}
 
-		fmt.Printf("%-15s %-10s %-20s %s\n", "GAME", "STATUS", "PORTS", "CONTAINER")
-		fmt.Printf("%-15s %-10s %-20s %s\n", "----", "------", "-----", "---------")
+		ui.Title("Server Status")
+		fmt.Println()
+
+		headers := []string{"GAME", "STATUS", "PORTS", "CONTAINER"}
+		var rows [][]string
 		for _, s := range statuses {
-			fmt.Printf("%-15s %-10s %-20s %s\n", s.Game, s.Status, s.Ports, s.ContainerID[:12])
+			status := s.Status
+			if s.Status == "running" {
+				status = ui.SymbolCheck + " running"
+			} else if s.Status == "exited" {
+				status = ui.SymbolCross + " stopped"
+			}
+			rows = append(rows, []string{s.Game, status, s.Ports, s.ContainerID[:12]})
 		}
+		ui.Table(headers, rows)
+
 		return nil
 	},
 }
@@ -154,24 +367,44 @@ var listCmd = &cobra.Command{
 	Short: "List available games",
 	Long:  "Show all games available in the registry.",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		spinner := ui.NewSpinner("Fetching game list")
+		spinner.Start()
+
 		games, err := registry.ListGames()
 		if err != nil {
+			spinner.Stop(false)
 			return err
 		}
+		spinner.Stop(true)
 
-		fmt.Printf("%-15s %s\n", "GAME", "DESCRIPTION")
-		fmt.Printf("%-15s %s\n", "----", "-----------")
+		fmt.Println()
+		ui.Title("Available Games")
+		fmt.Println()
+
+		headers := []string{"GAME", "DESCRIPTION"}
+		var rows [][]string
 		for _, g := range games {
-			fmt.Printf("%-15s %s\n", g.Name, g.Description)
+			rows = append(rows, []string{g.Name, g.Description})
 		}
+		ui.Table(headers, rows)
+
+		fmt.Println()
+		ui.Info("Install: hostathome install <game>")
+
 		return nil
 	},
 }
 
 func init() {
+	logsCmd.Flags().BoolP("follow", "f", false, "Follow log output")
+	logsCmd.Flags().StringP("tail", "n", "100", "Number of lines to show")
+
+	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(installCmd)
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(logsCmd)
+	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(listCmd)
 }

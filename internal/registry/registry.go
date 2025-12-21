@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	registryBaseURL = "https://raw.githubusercontent.com/hostathome/registry/main/games"
-	cacheDir        = ".hostathome/cache/registry"
-	cacheTTL        = 1 * time.Hour
+	registryBaseURL  = "https://raw.githubusercontent.com/hostathome/registry/main"
+	registryGamesURL = registryBaseURL + "/games"
+	cacheDir         = ".hostathome/cache/registry"
+	cacheTTL         = 1 * time.Hour
 )
 
 var gameCache = make(map[string]*Game)
@@ -61,7 +62,7 @@ func fetchWithCache(name string) ([]byte, error) {
 	}
 
 	// Fetch from GitHub
-	url := fmt.Sprintf("%s/%s.yaml", registryBaseURL, name)
+	url := fmt.Sprintf("%s/%s.yaml", registryGamesURL, name)
 	resp, err := http.Get(url)
 	if err != nil {
 		// Fall back to stale cache if available
@@ -131,7 +132,7 @@ func fetchGameIndex() ([]string, error) {
 	}
 
 	// Fetch index.yaml from GitHub
-	url := fmt.Sprintf("%s/../index.yaml", registryBaseURL)
+	url := registryBaseURL + "/index.yaml"
 	resp, err := http.Get(url)
 	if err != nil {
 		// Fall back to cache
