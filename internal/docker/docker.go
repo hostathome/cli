@@ -37,16 +37,15 @@ func PullImage(imageName string) error {
 	}
 	defer cli.Close()
 
-	fmt.Printf("Pulling %s...\n", imageName)
 	reader, err := cli.ImagePull(ctx, imageName, image.PullOptions{})
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
 
-	// Consume the output (shows progress)
-	io.Copy(os.Stdout, reader)
-	return nil
+	// Silently consume the output (spinner shows progress instead)
+	_, err = io.Copy(io.Discard, reader)
+	return err
 }
 
 // CreateServerDirs creates the directory structure for a game server
