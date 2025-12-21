@@ -179,6 +179,59 @@ func StopContainer(gameName string) error {
 	return cli.ContainerStop(ctx, containers[0].ID, container.StopOptions{})
 }
 
+// RemoveContainer removes a game server container but keeps the data
+func RemoveContainer(gameName string) error {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+
+	containerName := containerPrefix + gameName
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("name", containerName)),
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(containers) == 0 {
+		return fmt.Errorf("container %s not found", containerName)
+	}
+
+	c := containers[0]
+
+	// Stop if running
+	if c.State == "running" {
+		if err := cli.ContainerStop(ctx, c.ID, container.StopOptions{}); err != nil {
+			return fmt.Errorf("failed to stop container: %w", err)
+		}
+	}
+
+	// Remove container
+	return cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{
+		Force: true,
+	})
+}
+
+// RemoveImage removes the Docker image for a game
+func RemoveImage(imageName string) error {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+
+	_, err = cli.ImageRemove(ctx, imageName, image.RemoveOptions{
+		Force: true,
+	})
+	return err
+}
+
 // GetStatus returns the status of game containers
 func GetStatus(gameName string) ([]ContainerStatus, error) {
 	ctx := context.Background()

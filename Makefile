@@ -1,8 +1,8 @@
 .PHONY: build install clean test release deb
 
 BINARY=hostathome
-VERSION=0.1.0
-LDFLAGS=-ldflags "-X main.version=$(VERSION)"
+VERSION?=0.1.0
+LDFLAGS=-ldflags "-X main.cliVersion=$(VERSION)"
 
 build:
 	go build $(LDFLAGS) -o bin/$(BINARY) ./cmd/hostathome
@@ -62,7 +62,12 @@ deb:
 	dpkg-deb --build dist/deb/$(BINARY)_$(VERSION)_amd64
 	mv dist/deb/$(BINARY)_$(VERSION)_amd64.deb dist/
 	rm -rf dist/deb/$(BINARY)_$(VERSION)_amd64
+
+	# Create version-less copy for /latest/ downloads
+	cp dist/$(BINARY)_$(VERSION)_amd64.deb dist/$(BINARY)_amd64.deb
+
 	@echo "Created: dist/$(BINARY)_$(VERSION)_amd64.deb"
+	@echo "Created: dist/$(BINARY)_amd64.deb (for /latest/)"
 	@echo ""
 	@echo "Install with: sudo dpkg -i dist/$(BINARY)_$(VERSION)_amd64.deb"
 
@@ -94,4 +99,9 @@ deb-arm64:
 	dpkg-deb --build dist/deb/$(BINARY)_$(VERSION)_arm64
 	mv dist/deb/$(BINARY)_$(VERSION)_arm64.deb dist/
 	rm -rf dist/deb/$(BINARY)_$(VERSION)_arm64
+
+	# Create version-less copy for /latest/ downloads
+	cp dist/$(BINARY)_$(VERSION)_arm64.deb dist/$(BINARY)_arm64.deb
+
 	@echo "Created: dist/$(BINARY)_$(VERSION)_arm64.deb"
+	@echo "Created: dist/$(BINARY)_arm64.deb (for /latest/)"

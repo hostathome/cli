@@ -12,10 +12,11 @@ import (
 	"github.com/hostathome/cli/internal/docker"
 	"github.com/hostathome/cli/internal/registry"
 	"github.com/hostathome/cli/internal/ui"
+	"github.com/hostathome/cli/internal/version"
 	"github.com/spf13/cobra"
 )
 
-var version = "dev"
+var cliVersion = "dev"
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
@@ -30,9 +31,23 @@ var rootCmd = &cobra.Command{
 
 Run 'hostathome doctor' to check if your system is ready.
 Run 'hostathome list' to see available games.`,
-	Version: version,
+	Version: cliVersion,
 	SilenceErrors: true,
 	SilenceUsage:  true,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Skip update check for update command itself
+		if cmd.Name() == "update" || cmd.Name() == "version" {
+			return
+		}
+
+		// Check for updates (once per day max)
+		if hasUpdate, latest := version.CheckForUpdate(cliVersion); hasUpdate {
+			fmt.Println()
+			ui.Info("A new version of HostAtHome CLI is available: v%s (current: v%s)", latest, cliVersion)
+			ui.Detail("Update", "Run 'hostathome update' to upgrade")
+			fmt.Println()
+		}
+	},
 }
 
 var doctorCmd = &cobra.Command{
@@ -237,6 +252,103 @@ var stopCmd = &cobra.Command{
 	},
 }
 
+var removeCmd = &cobra.Command{
+	Use:   "remove <game>",
+	Short: "Remove a game server container",
+	Long:  "Remove the game server container but keep the data directory.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		gameName := args[0]
+
+		game, err := registry.GetGame(gameName)
+		if err != nil {
+			ui.Error("Game '%s' not found", gameName)
+			return err
+		}
+
+		spinner := ui.NewSpinner(fmt.Sprintf("Removing %s container", game.DisplayName))
+		spinner.Start()
+
+		if err := docker.RemoveContainer(gameName); err != nil {
+			spinner.Stop(false)
+			return fmt.Errorf("failed to remove container: %w", err)
+		}
+		spinner.Stop(true)
+
+		fmt.Println()
+		ui.Success("%s container removed.", game.DisplayName)
+		fmt.Println()
+		ui.Detail("Data preserved", fmt.Sprintf("./%s-server/", gameName))
+		ui.Info("Run 'hostathome run %s' to recreate the container", gameName)
+
+		return nil
+	},
+}
+
+var uninstallCmd = &cobra.Command{
+	Use:   "uninstall <game>",
+	Short: "Uninstall a game server completely",
+	Long:  "Remove the container, Docker image, and data directory.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		gameName := args[0]
+
+		game, err := registry.GetGame(gameName)
+		if err != nil {
+			ui.Error("Game '%s' not found", gameName)
+			return err
+		}
+
+		// Confirm before deleting data
+		fmt.Println()
+		ui.Warning("This will permanently delete all data for %s", game.DisplayName)
+		ui.Detail("Directory", fmt.Sprintf("./%s-server/", gameName))
+		fmt.Println()
+		fmt.Print("Are you sure? (yes/no): ")
+
+		var response string
+		fmt.Scanln(&response)
+		if response != "yes" && response != "y" {
+			ui.Info("Cancelled.")
+			return nil
+		}
+
+		// Remove container
+		spinner := ui.NewSpinner(fmt.Sprintf("Removing %s container", game.DisplayName))
+		spinner.Start()
+		if err := docker.RemoveContainer(gameName); err != nil {
+			// Container might not exist, that's ok
+			spinner.StopWithMessage(true, fmt.Sprintf("No container found for %s", game.DisplayName))
+		} else {
+			spinner.Stop(true)
+		}
+
+		// Remove image
+		spinner = ui.NewSpinner(fmt.Sprintf("Removing %s image", game.Image))
+		spinner.Start()
+		if err := docker.RemoveImage(game.Image); err != nil {
+			spinner.StopWithMessage(true, "Image not found (may be in use by other containers)")
+		} else {
+			spinner.Stop(true)
+		}
+
+		// Remove data directory
+		spinner = ui.NewSpinner("Removing data directory")
+		spinner.Start()
+		dataDir := fmt.Sprintf("./%s-server", gameName)
+		if err := os.RemoveAll(dataDir); err != nil {
+			spinner.Stop(false)
+			return fmt.Errorf("failed to remove data directory: %w", err)
+		}
+		spinner.Stop(true)
+
+		fmt.Println()
+		ui.Success("%s uninstalled completely.", game.DisplayName)
+
+		return nil
+	},
+}
+
 var logsCmd = &cobra.Command{
 	Use:   "logs <game>",
 	Short: "View server logs",
@@ -263,6 +375,60 @@ var logsCmd = &cobra.Command{
 		dockerCmd.Stderr = os.Stderr
 
 		return dockerCmd.Run()
+	},
+}
+
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Update HostAtHome CLI to the latest version",
+	Long:  "Download and install the latest version of HostAtHome CLI from GitHub releases.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ui.Title("HostAtHome CLI Update")
+		fmt.Println()
+
+		// Check for updates
+		spinner := ui.NewSpinner("Checking for updates")
+		spinner.Start()
+
+		latest, err := version.GetLatestVersion()
+		if err != nil {
+			spinner.Stop(false)
+			return fmt.Errorf("failed to check for updates: %w", err)
+		}
+		spinner.Stop(true)
+
+		// Compare versions
+		if !version.CompareVersions(cliVersion, latest) {
+			ui.Success("You're already running the latest version (v%s)", cliVersion)
+			return nil
+		}
+
+		fmt.Println()
+		ui.Info("New version available: v%s (current: v%s)", latest, cliVersion)
+		fmt.Println()
+
+		// Confirm update
+		fmt.Print("Do you want to update? (yes/no): ")
+		var response string
+		fmt.Scanln(&response)
+		if response != "yes" && response != "y" {
+			ui.Info("Update cancelled.")
+			return nil
+		}
+
+		fmt.Println()
+
+		// Perform update
+		if err := version.Update(); err != nil {
+			ui.Error("Update failed: %v", err)
+			return err
+		}
+
+		fmt.Println()
+		ui.Success("HostAtHome CLI updated to v%s!", latest)
+		ui.Info("Run 'hostathome --version' to verify")
+
+		return nil
 	},
 }
 
@@ -403,8 +569,11 @@ func init() {
 	rootCmd.AddCommand(installCmd)
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(removeCmd)
+	rootCmd.AddCommand(uninstallCmd)
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(updateCmd)
 }
