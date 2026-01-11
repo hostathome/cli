@@ -48,6 +48,21 @@ hostathome logs minecraft -f
 hostathome stop minecraft
 ```
 
+### Modifying Configuration
+
+```bash
+# Edit server settings
+hostathome config minecraft
+# Prompts to restart after editing
+
+# Edit mods
+hostathome mods minecraft
+# Prompts to restart after editing
+
+# Or manually restart
+hostathome restart minecraft
+```
+
 ### Updating
 
 The CLI automatically checks for updates once per day and notifies you when a new version is available:
@@ -76,11 +91,13 @@ hostathome uninstall minecraft
 | `install <game>` | Pull Docker image and create server directory |
 | `run <game>` | Start the game server container |
 | `stop <game>` | Stop the running container |
+| `restart <game>` | Restart container to apply config/mod changes |
 | `remove <game>` | Remove container but keep data directory |
 | `uninstall <game>` | Remove container, image, and data (prompts for confirmation) |
 | `status [game]` | Show status of running servers |
 | `logs <game>` | View server logs (`-f` to follow, `-n` for line count) |
-| `config <game>` | Edit server configuration in your default editor |
+| `config <game>` | Edit server configuration (prompts to restart) |
+| `mods <game>` | Edit mods configuration (prompts to restart) |
 | `update` | Update CLI to the latest version from GitHub releases |
 
 ## Directory Structure
@@ -119,11 +136,27 @@ Run `hostathome doctor` to verify your system is ready.
 
 ## Development
 
+### Quick Development Workflow
+
+```bash
+# Build and install dev version
+make build && sudo make install
+
+# Or use this one-liner to uninstall current + install dev:
+sudo dpkg -r hostathome 2>/dev/null; make build && sudo make install
+
+# Test the dev version
+hostathome --version
+hostathome list
+```
+
+### Build Commands
+
 ```bash
 # Build binary
 make build
 
-# Install locally
+# Install locally (requires sudo)
 make install
 
 # Run tests
@@ -134,6 +167,91 @@ make deb
 
 # Build for all platforms
 make release
+```
+
+### Development Tips
+
+**Hot reload during development:**
+```bash
+# Use the binary directly without installing
+make build
+./bin/hostathome list
+
+# Or create an alias
+alias hah='./bin/hostathome'
+hah list
+```
+
+**Testing changes:**
+```bash
+# 1. Make code changes
+# 2. Rebuild
+make build
+
+# 3. Test without installing
+./bin/hostathome install minecraft
+
+# 4. When ready, install system-wide
+sudo make install
+```
+
+## Development Mode
+
+### Testing Local Server Images
+
+When developing game server images, use the `--dev` flag to test without pulling from the registry:
+
+```bash
+# 1. Build your local image with :dev tag
+cd hostathome/servers/minecraft-server
+docker build -t minecraft-server:dev .
+
+# 2. Run using local image
+hostathome run minecraft --dev
+
+# 3. Make changes to config, entrypoint, or Python scripts
+# 4. Rebuild and restart
+docker build -t minecraft-server:dev .
+docker restart hostathome-minecraft
+
+# Or use the Makefile for convenience
+make rebuild
+```
+
+### The `--dev` Flag
+
+- Uses local `<game>-server:dev` image instead of pulling from registry
+- Useful for testing Docker image changes before pushing to production
+- Skips the image pull step, so changes are tested immediately
+- Requires the local image to exist first
+
+### Example Workflow
+
+```bash
+# Start with building the dev image
+cd hostathome/servers/minecraft-server
+make build
+
+# Start the server in dev mode
+cd /path/to/servers
+hostathome run minecraft --dev
+
+# Test configuration changes
+cat > minecraft-server/configs/mods.yaml <<EOF
+loader: vanilla
+modpack:
+  platform: curseforge
+  slug: "all-the-mods-9"
+  api-key: "your-key"
+mods: {}
+EOF
+
+# Quick rebuild and restart
+cd hostathome/servers/minecraft-server
+make rebuild
+
+# Check logs
+docker logs hostathome-minecraft -f
 ```
 
 ## Uninstallation

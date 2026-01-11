@@ -184,6 +184,8 @@ var installCmd = &cobra.Command{
 	},
 }
 
+var devMode bool
+
 var runCmd = &cobra.Command{
 	Use:   "run <game>",
 	Short: "Start a game server",
@@ -192,17 +194,44 @@ var runCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		gameName := args[0]
 
-		game, err := registry.GetGame(gameName)
-		if err != nil {
-			ui.Error("Game '%s' not found", gameName)
-			return err
+		var game *registry.Game
+		var err error
+
+		if devMode {
+			// Dev mode: use local :dev image
+			game = &registry.Game{
+				Name:        gameName,
+				DisplayName: gameName + " (dev)",
+				Image:       gameName + "-server:dev",
+				Ports: registry.Ports{
+					Player: 1024,
+					RCON:   1025,
+				},
+				InternalPorts: registry.Ports{
+					Player: 25565,
+					RCON:   25575,
+				},
+				Protocols: registry.Protocols{
+					Player: "tcp",
+					RCON:   "tcp",
+				},
+			}
+			fmt.Println("🔧 Development mode: using local image", game.Image)
+		} else {
+			// Normal mode: fetch from registry
+			game, err = registry.GetGame(gameName)
+			if err != nil {
+				ui.Error("Game '%s' not found", gameName)
+				return err
+			}
 		}
 
 		spinner := ui.NewSpinner(fmt.Sprintf("Starting %s", game.DisplayName))
 		spinner.Start()
 
-		if err := docker.RunContainer(gameName, game); err != nil {
+		if err := docker.RunContainer(gameName, game, devMode); err != nil {
 			spinner.Stop(false)
+			ui.Error("Failed to start container: %v", err)
 			return fmt.Errorf("failed to start container: %w", err)
 		}
 		spinner.Stop(true)
@@ -247,6 +276,37 @@ var stopCmd = &cobra.Command{
 
 		fmt.Println()
 		ui.Success("%s stopped.", game.DisplayName)
+
+		return nil
+	},
+}
+
+var restartCmd = &cobra.Command{
+	Use:   "restart <game>",
+	Short: "Restart a game server",
+	Long:  "Restart the game server container to apply configuration changes.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		gameName := args[0]
+
+		game, err := registry.GetGame(gameName)
+		if err != nil {
+			ui.Error("Game '%s' not found", gameName)
+			return err
+		}
+
+		spinner := ui.NewSpinner(fmt.Sprintf("Restarting %s", game.DisplayName))
+		spinner.Start()
+
+		if err := docker.RestartContainer(gameName); err != nil {
+			spinner.Stop(false)
+			return fmt.Errorf("failed to restart container: %w", err)
+		}
+		spinner.Stop(true)
+
+		fmt.Println()
+		ui.Success("%s restarted.", game.DisplayName)
+		ui.Info("Configuration changes have been applied")
 
 		return nil
 	},
@@ -476,7 +536,107 @@ var configCmd = &cobra.Command{
 		editorCmd.Stdout = os.Stdout
 		editorCmd.Stderr = os.Stderr
 
-		return editorCmd.Run()
+		if err := editorCmd.Run(); err != nil {
+			return err
+		}
+
+		// Prompt to restart
+		fmt.Println()
+		fmt.Print("Restart server to apply changes? (yes/no): ")
+		var response string
+		fmt.Scanln(&response)
+		if response == "yes" || response == "y" {
+			game, err := registry.GetGame(gameName)
+			if err != nil {
+				return err
+			}
+
+			spinner := ui.NewSpinner(fmt.Sprintf("Restarting %s", game.DisplayName))
+			spinner.Start()
+			if err := docker.RestartContainer(gameName); err != nil {
+				spinner.Stop(false)
+				ui.Warning("Failed to restart. Run 'hostathome restart %s' manually", gameName)
+			} else {
+				spinner.Stop(true)
+				ui.Success("Configuration applied!")
+			}
+		}
+
+		return nil
+	},
+}
+
+var modsCmd = &cobra.Command{
+	Use:   "mods <game>",
+	Short: "Edit mods configuration",
+	Long:  "Open the mods configuration file in your default editor.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		gameName := args[0]
+
+		modsPath := filepath.Join(fmt.Sprintf("./%s-server", gameName), "mods", "mods.yaml")
+
+		// Check if mods config exists
+		if _, err := os.Stat(modsPath); os.IsNotExist(err) {
+			ui.Error("Mods config not found: %s", modsPath)
+			ui.Info("Run 'hostathome install %s' first", gameName)
+			return err
+		}
+
+		// Get editor from env
+		editor := os.Getenv("EDITOR")
+		if editor == "" {
+			editor = os.Getenv("VISUAL")
+		}
+		if editor == "" {
+			// Try common editors
+			for _, e := range []string{"nano", "vim", "vi"} {
+				if _, err := exec.LookPath(e); err == nil {
+					editor = e
+					break
+				}
+			}
+		}
+		if editor == "" {
+			ui.Error("No editor found")
+			ui.Detail("Fix", "Set EDITOR environment variable")
+			return fmt.Errorf("no editor found")
+		}
+
+		ui.Info("Opening %s with %s...", modsPath, editor)
+
+		editorCmd := exec.Command(editor, modsPath)
+		editorCmd.Stdin = os.Stdin
+		editorCmd.Stdout = os.Stdout
+		editorCmd.Stderr = os.Stderr
+
+		if err := editorCmd.Run(); err != nil {
+			return err
+		}
+
+		// Prompt to restart
+		fmt.Println()
+		fmt.Print("Restart server to load mods? (yes/no): ")
+		var response string
+		fmt.Scanln(&response)
+		if response == "yes" || response == "y" {
+			game, err := registry.GetGame(gameName)
+			if err != nil {
+				return err
+			}
+
+			spinner := ui.NewSpinner(fmt.Sprintf("Restarting %s", game.DisplayName))
+			spinner.Start()
+			if err := docker.RestartContainer(gameName); err != nil {
+				spinner.Stop(false)
+				ui.Warning("Failed to restart. Run 'hostathome restart %s' manually", gameName)
+			} else {
+				spinner.Stop(true)
+				ui.Success("Mods configuration applied!")
+			}
+		}
+
+		return nil
 	},
 }
 
@@ -565,14 +725,18 @@ func init() {
 	logsCmd.Flags().BoolP("follow", "f", false, "Follow log output")
 	logsCmd.Flags().StringP("tail", "n", "100", "Number of lines to show")
 
+	runCmd.Flags().BoolVarP(&devMode, "dev", "d", false, "Use local dev image instead of registry")
+
 	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(installCmd)
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(restartCmd)
 	rootCmd.AddCommand(removeCmd)
 	rootCmd.AddCommand(uninstallCmd)
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(modsCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(updateCmd)
