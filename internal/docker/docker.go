@@ -52,11 +52,8 @@ func PullImage(imageName string) error {
 func CreateServerDirs(gameName string) error {
 	baseDir := fmt.Sprintf("./%s-server", gameName)
 	dirs := []string{
-		filepath.Join(baseDir, "save"),
-		filepath.Join(baseDir, "mods"),
 		filepath.Join(baseDir, "data"),
 		filepath.Join(baseDir, "configs"),
-		filepath.Join(baseDir, "backup"),
 	}
 
 	for _, dir := range dirs {
@@ -68,7 +65,7 @@ func CreateServerDirs(gameName string) error {
 }
 
 // RunContainer starts a game server container
-func RunContainer(gameName string, game *registry.Game) error {
+func RunContainer(gameName string, game *registry.Game, devMode bool) error {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -96,6 +93,22 @@ func RunContainer(gameName string, game *registry.Game) error {
 		}
 		fmt.Printf("Starting existing container %s...\n", containerName)
 		return cli.ContainerStart(ctx, c.ID, container.StartOptions{})
+	}
+
+	// In dev mode, skip image pull and verify local image exists
+	if devMode {
+		fmt.Println("🔧 Dev mode: skipping image pull, using local image")
+		images, err := cli.ImageList(ctx, image.ListOptions{
+			Filters: filters.NewArgs(filters.Arg("reference", game.Image)),
+		})
+		if err != nil || len(images) == 0 {
+			return fmt.Errorf("local image %s not found. Build it first with: docker build -t %s .", game.Image, game.Image)
+		}
+	} else {
+		// Normal mode: pull the image from registry
+		if err := PullImage(game.Image); err != nil {
+			return fmt.Errorf("failed to pull image: %w", err)
+		}
 	}
 
 	// Create new container
@@ -136,8 +149,13 @@ func RunContainer(gameName string, game *registry.Game) error {
 		Mounts: []mount.Mount{
 			{
 				Type:   mount.TypeBind,
-				Source: absPath,
+				Source: filepath.Join(absPath, "data"),
 				Target: "/data",
+			},
+			{
+				Type:   mount.TypeBind,
+				Source: filepath.Join(absPath, "configs"),
+				Target: "/configs",
 			},
 		},
 		RestartPolicy: container.RestartPolicy{
@@ -176,6 +194,32 @@ func StopContainer(gameName string) error {
 	}
 
 	return cli.ContainerStop(ctx, containers[0].ID, container.StopOptions{})
+}
+
+// RestartContainer restarts a game server container
+func RestartContainer(gameName string) error {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+
+	containerName := containerPrefix + gameName
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("name", containerName)),
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(containers) == 0 {
+		return fmt.Errorf("container %s not found", containerName)
+	}
+
+	return cli.ContainerRestart(ctx, containers[0].ID, container.StopOptions{})
 }
 
 // RemoveContainer removes a game server container but keeps the data
