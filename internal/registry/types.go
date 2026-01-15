@@ -2,15 +2,14 @@ package registry
 
 // Game represents a game server definition from the registry
 type Game struct {
-	Name          string            `yaml:"name"`
-	DisplayName   string            `yaml:"display_name"`
-	Description   string            `yaml:"description"`
-	Image         string            `yaml:"image"`
-	Ports         Ports             `yaml:"ports"`
-	InternalPorts Ports             `yaml:"internal_ports"`
-	Protocols     Protocols         `yaml:"protocols"`
-	Volumes       []string          `yaml:"volumes"`
-	ConfigSchema  map[string]any    `yaml:"config_schema"`
+	Name          string    `yaml:"name"`
+	DisplayName   string    `yaml:"display_name"`
+	Description   string    `yaml:"description"`
+	Image         string    `yaml:"image"`
+	Ports         Ports     `yaml:"ports"`
+	InternalPorts Ports     `yaml:"internal_ports"`
+	Protocols     Protocols `yaml:"protocols"`
+	Volumes       []string  `yaml:"volumes"`
 }
 
 // Ports defines port mappings
@@ -25,17 +24,21 @@ type Protocols struct {
 	RCON   string `yaml:"rcon"`
 }
 
-// DefaultProtocol returns the protocol or "tcp" if not set
+// DefaultProtocol returns the protocol for a port name, defaulting to "tcp" if not set
+// Returns "tcp" if port name is invalid
 func (p Protocols) DefaultProtocol(port string) string {
-	var proto string
 	switch port {
 	case "player":
-		proto = p.Player
+		if p.Player != "" {
+			return p.Player
+		}
 	case "rcon":
-		proto = p.RCON
-	}
-	if proto == "" {
+		if p.RCON != "" {
+			return p.RCON
+		}
+	default:
+		// Invalid port name, log but default to tcp
 		return "tcp"
 	}
-	return proto
+	return "tcp"
 }

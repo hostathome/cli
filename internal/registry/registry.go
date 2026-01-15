@@ -1,33 +1,66 @@
 package registry
 
 import (
+	"archive/tar"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+	"github.com/hostathome/cli/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	registryBaseURL  = "https://raw.githubusercontent.com/hostathome/registry/main"
-	registryGamesURL = registryBaseURL + "/games"
-	cacheDir         = ".hostathome/cache/registry"
-	cacheTTL         = 1 * time.Hour
+	registryBaseURL   = "https://raw.githubusercontent.com/hostathome/registry/main"
+	registryGamesURL  = registryBaseURL + "/games"
+	cacheTTL          = 1 * time.Hour
+	httpTimeout       = 30  // seconds
+	dockerOpTimeout   = 30  // seconds
 )
 
 var gameCache = make(map[string]*Game)
 
+// validateGameName checks if gameName is valid for use in paths
+func validateGameName(gameName string) error {
+	if gameName == "" {
+		return fmt.Errorf("game name cannot be empty")
+	}
+	if len(gameName) > 63 {
+		return fmt.Errorf("game name too long (max 63 chars)")
+	}
+	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(gameName) {
+		return fmt.Errorf("game name contains invalid characters (only alphanumeric, hyphen, underscore allowed)")
+	}
+	if strings.Contains(gameName, "..") || strings.HasPrefix(gameName, "/") || strings.HasPrefix(gameName, ".") {
+		return fmt.Errorf("game name cannot contain path traversal sequences")
+	}
+	return nil
+}
+
+// getHTTPClient returns an HTTP client with timeout
+func getHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: time.Duration(httpTimeout) * time.Second,
+	}
+}
+
 // getCacheDir returns the full path to the cache directory
 func getCacheDir() string {
-	home, err := os.UserHomeDir()
+	cacheDir, err := config.GetCacheDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, cacheDir)
+	return cacheDir
 }
 
 // GetGame returns a game definition by name
@@ -63,7 +96,7 @@ func fetchWithCache(name string) ([]byte, error) {
 
 	// Fetch from GitHub
 	url := fmt.Sprintf("%s/%s.yaml", registryGamesURL, name)
-	resp, err := http.Get(url)
+	resp, err := getHTTPClient().Get(url)
 	if err != nil {
 		// Fall back to stale cache if available
 		if data, cacheErr := os.ReadFile(cacheFile); cacheErr == nil {
@@ -89,10 +122,15 @@ func fetchWithCache(name string) ([]byte, error) {
 		return nil, err
 	}
 
-	// Save to cache
+	// Save to cache (non-critical, don't fail if it fails)
 	if dir := getCacheDir(); dir != "" {
-		os.MkdirAll(dir, 0755)
-		os.WriteFile(cacheFile, data, 0644)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			// Log but don't fail - cache is optional
+			_ = err
+		} else if err := os.WriteFile(cacheFile, data, 0644); err != nil {
+			// Log but don't fail - cache is optional
+			_ = err
+		}
 	}
 
 	return data, nil
@@ -123,39 +161,45 @@ func fetchGameIndex() ([]string, error) {
 	// Check cache
 	if info, err := os.Stat(cacheFile); err == nil {
 		if time.Since(info.ModTime()) < cacheTTL {
-			data, _ := os.ReadFile(cacheFile)
-			var index []string
-			if json.Unmarshal(data, &index) == nil {
-				return index, nil
+			if data, err := os.ReadFile(cacheFile); err == nil {
+				var index []string
+				if err := json.Unmarshal(data, &index); err == nil && len(index) > 0 {
+					return index, nil
+				}
 			}
 		}
 	}
 
 	// Fetch index.yaml from GitHub
 	url := registryBaseURL + "/index.yaml"
-	resp, err := http.Get(url)
+	resp, err := getHTTPClient().Get(url)
 	if err != nil {
-		// Fall back to cache
-		if data, _ := os.ReadFile(cacheFile); len(data) > 0 {
+		// Fall back to cache if available
+		if data, cacheErr := os.ReadFile(cacheFile); cacheErr == nil && len(data) > 0 {
 			var index []string
-			json.Unmarshal(data, &index)
-			return index, nil
+			if cacheParseErr := json.Unmarshal(data, &index); cacheParseErr == nil && len(index) > 0 {
+				return index, nil
+			}
 		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		// Fall back to cache
-		if data, _ := os.ReadFile(cacheFile); len(data) > 0 {
+		// Fall back to cache if available
+		if data, cacheErr := os.ReadFile(cacheFile); cacheErr == nil && len(data) > 0 {
 			var index []string
-			json.Unmarshal(data, &index)
-			return index, nil
+			if cacheParseErr := json.Unmarshal(data, &index); cacheParseErr == nil && len(index) > 0 {
+				return index, nil
+			}
 		}
 		return nil, fmt.Errorf("failed to fetch game index: %s", resp.Status)
 	}
 
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 
 	var indexFile struct {
 		Games []string `yaml:"games"`
@@ -164,58 +208,114 @@ func fetchGameIndex() ([]string, error) {
 		return nil, err
 	}
 
-	// Cache as JSON
+	// Cache as JSON (non-critical, don't fail if it fails)
 	if dir := getCacheDir(); dir != "" {
-		os.MkdirAll(dir, 0755)
-		jsonData, _ := json.Marshal(indexFile.Games)
-		os.WriteFile(cacheFile, jsonData, 0644)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			_ = err // Log but don't fail - cache is optional
+		} else if jsonData, err := json.Marshal(indexFile.Games); err == nil {
+			_ = os.WriteFile(cacheFile, jsonData, 0644) // Log but don't fail
+		}
 	}
 
 	return indexFile.Games, nil
 }
 
-// CopyDefaultConfig copies the default config.yaml if it doesn't exist
+// CopyDefaultConfig extracts default configs from the Docker image
 func CopyDefaultConfig(gameName string, game *Game) error {
-	configDir := fmt.Sprintf("./%s-server/configs", gameName)
-	configPath := filepath.Join(configDir, "config.yaml")
-
-	// Check if config already exists
-	if _, err := os.Stat(configPath); err == nil {
-		return nil // Already exists
+	if err := validateGameName(gameName); err != nil {
+		return fmt.Errorf("invalid game name: %w", err)
 	}
 
-	// Generate default config from schema
-	defaultConfig := generateDefaultConfig(game.ConfigSchema)
+	serverDir := fmt.Sprintf("./%s-server", gameName)
+	configDir := filepath.Join(serverDir, "configs")
 
-	data, err := yaml.Marshal(defaultConfig)
+	// Create configs directory if it doesn't exist
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	// Extract configs from the Docker image
+	ctx, cancel := context.WithTimeout(context.Background(), dockerOpTimeout*time.Second)
+	defer cancel()
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return err
+		return fmt.Errorf("docker not available: %w", err)
+	}
+	defer cli.Close()
+
+	// Copy config.yaml if it doesn't exist
+	configPath := filepath.Join(configDir, "config.yaml")
+	if _, err := os.Stat(configPath); err != nil {
+		if err := extractFileFromImage(ctx, cli, game.Image, "/defaults/config.yaml", configPath); err != nil {
+			return fmt.Errorf("failed to extract config: %w", err)
+		}
 	}
 
-	// Add header comment
-	header := fmt.Sprintf("# %s Server Configuration\n\n", game.DisplayName)
-	return os.WriteFile(configPath, append([]byte(header), data...), 0644)
+	// Copy mods.yaml if it doesn't exist
+	modsPath := filepath.Join(configDir, "mods.yaml")
+	if _, err := os.Stat(modsPath); err != nil {
+		if err := extractFileFromImage(ctx, cli, game.Image, "/defaults/mods.yaml", modsPath); err != nil {
+			// mods.yaml is optional, don't fail if extraction fails
+		}
+	}
+
+	return nil
 }
 
-// generateDefaultConfig creates a config map from the schema with defaults
-func generateDefaultConfig(schema map[string]any) map[string]any {
-	config := make(map[string]any)
+// extractFileFromImage uses a temporary container to extract files from a Docker image
+func extractFileFromImage(ctx context.Context, cli *client.Client, imageRef, containerPath, destPath string) error {
+	// Create a temporary container
+	resp, err := cli.ContainerCreate(ctx, &container.Config{Image: imageRef}, nil, nil, nil, "")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary container: %w", err)
+	}
+	defer func() {
+		// Clean up temporary container (use docker CLI to avoid depending on a specific SDK type)
+		_ = exec.Command("docker", "rm", "-f", resp.ID).Run()
+	}()
 
-	for section, fields := range schema {
-		sectionMap := make(map[string]any)
-		if fieldMap, ok := fields.(map[string]any); ok {
-			for field, spec := range fieldMap {
-				if specMap, ok := spec.(map[string]any); ok {
-					if def, exists := specMap["default"]; exists {
-						sectionMap[field] = def
-					}
-				}
+	// Copy file from container
+	readCloser, _, err := cli.CopyFromContainer(ctx, resp.ID, containerPath)
+	if err != nil {
+		return fmt.Errorf("failed to copy from container: %w", err)
+	}
+	defer readCloser.Close()
+
+	// Extract from tar archive
+	// When copying /path/to/file, the tar archive contains just the filename
+	expectedName := filepath.Base(containerPath)
+	tr := tar.NewReader(readCloser)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			return fmt.Errorf("file %s not found in image", containerPath)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read tar: %w", err)
+		}
+
+		// Match the filename in the tar archive
+		if header.Name == expectedName {
+			// Write the file
+			file, err := os.Create(destPath)
+			if err != nil {
+				return fmt.Errorf("failed to create destination file: %w", err)
 			}
-		}
-		if len(sectionMap) > 0 {
-			config[section] = sectionMap
+			defer file.Close()
+
+			if _, err := io.Copy(file, tr); err != nil {
+				return fmt.Errorf("failed to write file: %w", err)
+			}
+
+			// Set proper permissions (user read/write, group/other readable)
+			if err := os.Chmod(destPath, 0644); err != nil {
+				return fmt.Errorf("failed to set file permissions: %w", err)
+			}
+
+			return nil
 		}
 	}
-
-	return config
 }
+

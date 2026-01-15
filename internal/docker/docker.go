@@ -6,7 +6,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -18,7 +21,57 @@ import (
 	"github.com/hostathome/cli/internal/registry"
 )
 
-const containerPrefix = "hostathome-"
+const (
+	containerPrefix   = "hostathome-"
+	dockerOpTimeout   = 30  // seconds for container operations
+	dockerPullTimeout = 300 // seconds for image pull (5 minutes)
+	minPort           = 1
+	maxPort           = 65535
+)
+
+var (
+	dockerClient *client.Client
+	clientOnce   sync.Once
+	clientErr    error
+)
+
+// getClient returns a reusable Docker client (singleton pattern)
+func getClient() (*client.Client, error) {
+	clientOnce.Do(func() {
+		dockerClient, clientErr = client.NewClientWithOpts(
+			client.FromEnv,
+			client.WithAPIVersionNegotiation(),
+		)
+	})
+	return dockerClient, clientErr
+}
+
+// ValidateGameName checks if gameName is valid for use in paths and container names
+func ValidateGameName(gameName string) error {
+	if gameName == "" {
+		return fmt.Errorf("game name cannot be empty")
+	}
+	if len(gameName) > 63 {
+		return fmt.Errorf("game name too long (max 63 chars)")
+	}
+	// Allow alphanumeric, hyphen, underscore. Match Docker container name restrictions
+	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(gameName) {
+		return fmt.Errorf("game name contains invalid characters (only alphanumeric, hyphen, underscore allowed)")
+	}
+	// Prevent path traversal attempts
+	if strings.Contains(gameName, "..") || strings.HasPrefix(gameName, "/") || strings.HasPrefix(gameName, ".") {
+		return fmt.Errorf("game name cannot contain path traversal sequences")
+	}
+	return nil
+}
+
+// ValidatePort checks if a port number is valid
+func ValidatePort(port int, name string) error {
+	if port < minPort || port > maxPort {
+		return fmt.Errorf("%s port %d out of range (%d-%d)", name, port, minPort, maxPort)
+	}
+	return nil
+}
 
 // ContainerStatus represents the status of a game container
 type ContainerStatus struct {
@@ -30,12 +83,13 @@ type ContainerStatus struct {
 
 // PullImage pulls the Docker image for a game
 func PullImage(imageName string) error {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	ctx, cancel := context.WithTimeout(context.Background(), dockerPullTimeout*time.Second)
+	defer cancel()
+
+	cli, err := getClient()
 	if err != nil {
 		return err
 	}
-	defer cli.Close()
 
 	reader, err := cli.ImagePull(ctx, imageName, image.PullOptions{})
 	if err != nil {
@@ -50,6 +104,10 @@ func PullImage(imageName string) error {
 
 // CreateServerDirs creates the directory structure for a game server
 func CreateServerDirs(gameName string) error {
+	if err := ValidateGameName(gameName); err != nil {
+		return fmt.Errorf("invalid game name: %w", err)
+	}
+
 	baseDir := fmt.Sprintf("./%s-server", gameName)
 	dirs := []string{
 		filepath.Join(baseDir, "data"),
@@ -66,12 +124,17 @@ func CreateServerDirs(gameName string) error {
 
 // RunContainer starts a game server container
 func RunContainer(gameName string, game *registry.Game, devMode bool) error {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err := ValidateGameName(gameName); err != nil {
+		return fmt.Errorf("invalid game name: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerOpTimeout*time.Second)
+	defer cancel()
+
+	cli, err := getClient()
 	if err != nil {
 		return err
 	}
-	defer cli.Close()
 
 	containerName := containerPrefix + gameName
 
@@ -117,11 +180,33 @@ func RunContainer(gameName string, game *registry.Game, devMode bool) error {
 		return err
 	}
 
+	// Validate port mappings
+	if game.Ports.Player > 0 {
+		if err := ValidatePort(game.Ports.Player, "external player"); err != nil {
+			return err
+		}
+	}
+	if game.Ports.RCON > 0 {
+		if err := ValidatePort(game.Ports.RCON, "external RCON"); err != nil {
+			return err
+		}
+	}
+	if game.InternalPorts.Player > 0 {
+		if err := ValidatePort(game.InternalPorts.Player, "internal player"); err != nil {
+			return err
+		}
+	}
+	if game.InternalPorts.RCON > 0 {
+		if err := ValidatePort(game.InternalPorts.RCON, "internal RCON"); err != nil {
+			return err
+		}
+	}
+
 	// Port mappings
 	portBindings := nat.PortMap{}
 	exposedPorts := nat.PortSet{}
 
-	if game.InternalPorts.Player > 0 {
+	if game.InternalPorts.Player > 0 && game.Ports.Player > 0 {
 		playerProto := game.Protocols.DefaultProtocol("player")
 		internalPort := nat.Port(fmt.Sprintf("%d/%s", game.InternalPorts.Player, playerProto))
 		portBindings[internalPort] = []nat.PortBinding{{HostPort: fmt.Sprintf("%d", game.Ports.Player)}}
@@ -173,12 +258,17 @@ func RunContainer(gameName string, game *registry.Game, devMode bool) error {
 
 // StopContainer stops a game server container
 func StopContainer(gameName string) error {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err := ValidateGameName(gameName); err != nil {
+		return fmt.Errorf("invalid game name: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerOpTimeout*time.Second)
+	defer cancel()
+
+	cli, err := getClient()
 	if err != nil {
 		return err
 	}
-	defer cli.Close()
 
 	containerName := containerPrefix + gameName
 
@@ -198,12 +288,17 @@ func StopContainer(gameName string) error {
 
 // RestartContainer restarts a game server container
 func RestartContainer(gameName string) error {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err := ValidateGameName(gameName); err != nil {
+		return fmt.Errorf("invalid game name: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerOpTimeout*time.Second)
+	defer cancel()
+
+	cli, err := getClient()
 	if err != nil {
 		return err
 	}
-	defer cli.Close()
 
 	containerName := containerPrefix + gameName
 
@@ -224,12 +319,17 @@ func RestartContainer(gameName string) error {
 
 // RemoveContainer removes a game server container but keeps the data
 func RemoveContainer(gameName string) error {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err := ValidateGameName(gameName); err != nil {
+		return fmt.Errorf("invalid game name: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerOpTimeout*time.Second)
+	defer cancel()
+
+	cli, err := getClient()
 	if err != nil {
 		return err
 	}
-	defer cli.Close()
 
 	containerName := containerPrefix + gameName
 
@@ -262,12 +362,13 @@ func RemoveContainer(gameName string) error {
 
 // RemoveImage removes the Docker image for a game
 func RemoveImage(imageName string) error {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	ctx, cancel := context.WithTimeout(context.Background(), dockerOpTimeout*time.Second)
+	defer cancel()
+
+	cli, err := getClient()
 	if err != nil {
 		return err
 	}
-	defer cli.Close()
 
 	_, err = cli.ImageRemove(ctx, imageName, image.RemoveOptions{
 		Force: true,
@@ -277,12 +378,13 @@ func RemoveImage(imageName string) error {
 
 // GetStatus returns the status of game containers
 func GetStatus(gameName string) ([]ContainerStatus, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	ctx, cancel := context.WithTimeout(context.Background(), dockerOpTimeout*time.Second)
+	defer cancel()
+
+	cli, err := getClient()
 	if err != nil {
 		return nil, err
 	}
-	defer cli.Close()
 
 	filterArgs := filters.NewArgs(filters.Arg("label", "hostathome=true"))
 	if gameName != "" {
@@ -300,7 +402,7 @@ func GetStatus(gameName string) ([]ContainerStatus, error) {
 	var statuses []ContainerStatus
 	for _, c := range containers {
 		game := c.Labels["hostathome.game"]
-		if game == "" {
+		if game == "" && len(c.Names) > 0 {
 			game = strings.TrimPrefix(c.Names[0], "/"+containerPrefix)
 		}
 

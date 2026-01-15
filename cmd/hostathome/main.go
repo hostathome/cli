@@ -5,14 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/hostathome/cli/internal/docker"
 	"github.com/hostathome/cli/internal/registry"
 	"github.com/hostathome/cli/internal/ui"
-	"github.com/hostathome/cli/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -25,29 +23,12 @@ func main() {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "hostathome",
-	Short: "Manage game servers with ease",
-	Long: `HostAtHome CLI - Install, run, and manage game servers using Docker.
-
-Run 'hostathome doctor' to check if your system is ready.
-Run 'hostathome list' to see available games.`,
-	Version: cliVersion,
+	Use:           "hostathome",
+	Short:         "Manage game servers with ease",
+	Long:          `HostAtHome CLI - Install, run, and manage game servers using Docker.`,
+	Version:       cliVersion,
 	SilenceErrors: true,
 	SilenceUsage:  true,
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		// Skip update check for update command itself
-		if cmd.Name() == "update" || cmd.Name() == "version" {
-			return
-		}
-
-		// Check for updates (once per day max)
-		if hasUpdate, latest := version.CheckForUpdate(cliVersion); hasUpdate {
-			fmt.Println()
-			ui.Info("A new version of HostAtHome CLI is available: v%s (current: v%s)", latest, cliVersion)
-			ui.Detail("Update", "Run 'hostathome update' to upgrade")
-			fmt.Println()
-		}
-	},
 }
 
 var doctorCmd = &cobra.Command{
@@ -438,208 +419,6 @@ var logsCmd = &cobra.Command{
 	},
 }
 
-var updateCmd = &cobra.Command{
-	Use:   "update",
-	Short: "Update HostAtHome CLI to the latest version",
-	Long:  "Download and install the latest version of HostAtHome CLI from GitHub releases.",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		ui.Title("HostAtHome CLI Update")
-		fmt.Println()
-
-		// Check for updates
-		spinner := ui.NewSpinner("Checking for updates")
-		spinner.Start()
-
-		latest, err := version.GetLatestVersion()
-		if err != nil {
-			spinner.Stop(false)
-			return fmt.Errorf("failed to check for updates: %w", err)
-		}
-		spinner.Stop(true)
-
-		// Compare versions
-		if !version.CompareVersions(cliVersion, latest) {
-			ui.Success("You're already running the latest version (v%s)", cliVersion)
-			return nil
-		}
-
-		fmt.Println()
-		ui.Info("New version available: v%s (current: v%s)", latest, cliVersion)
-		fmt.Println()
-
-		// Confirm update
-		fmt.Print("Do you want to update? (yes/no): ")
-		var response string
-		fmt.Scanln(&response)
-		if response != "yes" && response != "y" {
-			ui.Info("Update cancelled.")
-			return nil
-		}
-
-		fmt.Println()
-
-		// Perform update
-		if err := version.Update(); err != nil {
-			ui.Error("Update failed: %v", err)
-			return err
-		}
-
-		fmt.Println()
-		ui.Success("HostAtHome CLI updated to v%s!", latest)
-		ui.Info("Run 'hostathome --version' to verify")
-
-		return nil
-	},
-}
-
-var configCmd = &cobra.Command{
-	Use:   "config <game>",
-	Short: "Edit server configuration",
-	Long:  "Open the server configuration file in your default editor.",
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		gameName := args[0]
-
-		configPath := filepath.Join(fmt.Sprintf("./%s-server", gameName), "configs", "config.yaml")
-
-		// Check if config exists
-		if _, err := os.Stat(configPath); os.IsNotExist(err) {
-			ui.Error("Config not found: %s", configPath)
-			ui.Info("Run 'hostathome install %s' first", gameName)
-			return err
-		}
-
-		// Get editor from env
-		editor := os.Getenv("EDITOR")
-		if editor == "" {
-			editor = os.Getenv("VISUAL")
-		}
-		if editor == "" {
-			// Try common editors
-			for _, e := range []string{"nano", "vim", "vi"} {
-				if _, err := exec.LookPath(e); err == nil {
-					editor = e
-					break
-				}
-			}
-		}
-		if editor == "" {
-			ui.Error("No editor found")
-			ui.Detail("Fix", "Set EDITOR environment variable")
-			return fmt.Errorf("no editor found")
-		}
-
-		ui.Info("Opening %s with %s...", configPath, editor)
-
-		editorCmd := exec.Command(editor, configPath)
-		editorCmd.Stdin = os.Stdin
-		editorCmd.Stdout = os.Stdout
-		editorCmd.Stderr = os.Stderr
-
-		if err := editorCmd.Run(); err != nil {
-			return err
-		}
-
-		// Prompt to restart
-		fmt.Println()
-		fmt.Print("Restart server to apply changes? (yes/no): ")
-		var response string
-		fmt.Scanln(&response)
-		if response == "yes" || response == "y" {
-			game, err := registry.GetGame(gameName)
-			if err != nil {
-				return err
-			}
-
-			spinner := ui.NewSpinner(fmt.Sprintf("Restarting %s", game.DisplayName))
-			spinner.Start()
-			if err := docker.RestartContainer(gameName); err != nil {
-				spinner.Stop(false)
-				ui.Warning("Failed to restart. Run 'hostathome restart %s' manually", gameName)
-			} else {
-				spinner.Stop(true)
-				ui.Success("Configuration applied!")
-			}
-		}
-
-		return nil
-	},
-}
-
-var modsCmd = &cobra.Command{
-	Use:   "mods <game>",
-	Short: "Edit mods configuration",
-	Long:  "Open the mods configuration file in your default editor.",
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		gameName := args[0]
-
-		modsPath := filepath.Join(fmt.Sprintf("./%s-server", gameName), "mods", "mods.yaml")
-
-		// Check if mods config exists
-		if _, err := os.Stat(modsPath); os.IsNotExist(err) {
-			ui.Error("Mods config not found: %s", modsPath)
-			ui.Info("Run 'hostathome install %s' first", gameName)
-			return err
-		}
-
-		// Get editor from env
-		editor := os.Getenv("EDITOR")
-		if editor == "" {
-			editor = os.Getenv("VISUAL")
-		}
-		if editor == "" {
-			// Try common editors
-			for _, e := range []string{"nano", "vim", "vi"} {
-				if _, err := exec.LookPath(e); err == nil {
-					editor = e
-					break
-				}
-			}
-		}
-		if editor == "" {
-			ui.Error("No editor found")
-			ui.Detail("Fix", "Set EDITOR environment variable")
-			return fmt.Errorf("no editor found")
-		}
-
-		ui.Info("Opening %s with %s...", modsPath, editor)
-
-		editorCmd := exec.Command(editor, modsPath)
-		editorCmd.Stdin = os.Stdin
-		editorCmd.Stdout = os.Stdout
-		editorCmd.Stderr = os.Stderr
-
-		if err := editorCmd.Run(); err != nil {
-			return err
-		}
-
-		// Prompt to restart
-		fmt.Println()
-		fmt.Print("Restart server to load mods? (yes/no): ")
-		var response string
-		fmt.Scanln(&response)
-		if response == "yes" || response == "y" {
-			game, err := registry.GetGame(gameName)
-			if err != nil {
-				return err
-			}
-
-			spinner := ui.NewSpinner(fmt.Sprintf("Restarting %s", game.DisplayName))
-			spinner.Start()
-			if err := docker.RestartContainer(gameName); err != nil {
-				spinner.Stop(false)
-				ui.Warning("Failed to restart. Run 'hostathome restart %s' manually", gameName)
-			} else {
-				spinner.Stop(true)
-				ui.Success("Mods configuration applied!")
-			}
-		}
-
-		return nil
-	},
-}
-
 var statusCmd = &cobra.Command{
 	Use:   "status [game]",
 	Short: "Show server status",
@@ -735,9 +514,6 @@ func init() {
 	rootCmd.AddCommand(removeCmd)
 	rootCmd.AddCommand(uninstallCmd)
 	rootCmd.AddCommand(logsCmd)
-	rootCmd.AddCommand(configCmd)
-	rootCmd.AddCommand(modsCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(listCmd)
-	rootCmd.AddCommand(updateCmd)
 }

@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -99,8 +100,9 @@ type Spinner struct {
 	message  string
 	frames   []string
 	interval time.Duration
-	done     chan bool
+	done     chan struct{}
 	running  bool
+	mu       sync.Mutex
 }
 
 // NewSpinner creates a new spinner
@@ -109,7 +111,7 @@ func NewSpinner(message string) *Spinner {
 		message:  message,
 		frames:   []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
 		interval: 80 * time.Millisecond,
-		done:     make(chan bool),
+		done:     make(chan struct{}, 1), // Buffered to prevent blocking
 	}
 }
 
@@ -119,7 +121,14 @@ func (s *Spinner) Start() {
 		fmt.Printf("%s %s...\n", SymbolArrow, s.message)
 		return
 	}
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return
+	}
 	s.running = true
+	s.mu.Unlock()
+
 	go func() {
 		i := 0
 		for {
@@ -135,12 +144,23 @@ func (s *Spinner) Start() {
 	}()
 }
 
+// stop signals the spinner goroutine to exit (thread-safe)
+func (s *Spinner) stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		s.running = false
+		// Non-blocking send to buffered channel
+		select {
+		case s.done <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // Stop stops the spinner with a result
 func (s *Spinner) Stop(success bool) {
-	if s.running {
-		s.done <- true
-		s.running = false
-	}
+	s.stop()
 	if isTerminal() {
 		fmt.Print("\r\033[K") // Clear line
 	}
@@ -153,10 +173,7 @@ func (s *Spinner) Stop(success bool) {
 
 // StopWithMessage stops the spinner with a custom message
 func (s *Spinner) StopWithMessage(success bool, message string) {
-	if s.running {
-		s.done <- true
-		s.running = false
-	}
+	s.stop()
 	if isTerminal() {
 		fmt.Print("\r\033[K") // Clear line
 	}
@@ -169,15 +186,21 @@ func (s *Spinner) StopWithMessage(success bool, message string) {
 
 // Table prints a formatted table
 func Table(headers []string, rows [][]string) {
+	if len(headers) == 0 {
+		return
+	}
+
 	// Calculate column widths
 	widths := make([]int, len(headers))
 	for i, h := range headers {
 		widths[i] = len(h)
 	}
+
+	// Update widths based on row values, but only for columns that match headers
 	for _, row := range rows {
-		for i, cell := range row {
-			if i < len(widths) && len(cell) > widths[i] {
-				widths[i] = len(cell)
+		for i := 0; i < len(headers) && i < len(row); i++ {
+			if len(row[i]) > widths[i] {
+				widths[i] = len(row[i])
 			}
 		}
 	}
@@ -197,12 +220,14 @@ func Table(headers []string, rows [][]string) {
 	}
 	fmt.Println()
 
-	// Print rows
+	// Print rows (only print columns that match headers)
 	for _, row := range rows {
-		for i, cell := range row {
-			if i < len(widths) {
-				fmt.Printf("%-*s  ", widths[i], cell)
+		for i := 0; i < len(headers); i++ {
+			cell := ""
+			if i < len(row) {
+				cell = row[i]
 			}
+			fmt.Printf("%-*s  ", widths[i], cell)
 		}
 		fmt.Println()
 	}
