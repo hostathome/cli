@@ -207,7 +207,16 @@ var runCmd = &cobra.Command{
 			}
 		}
 
-		spinner := ui.NewSpinner(fmt.Sprintf("Starting %s", game.DisplayName))
+		// Create directory structure if it doesn't exist
+		spinner := ui.NewSpinner("Creating directory structure")
+		spinner.Start()
+		if err := docker.CreateServerDirs(gameName); err != nil {
+			spinner.Stop(false)
+			return fmt.Errorf("failed to create directories: %w", err)
+		}
+		spinner.Stop(true)
+
+		spinner = ui.NewSpinner(fmt.Sprintf("Starting %s", game.DisplayName))
 		spinner.Start()
 
 		if err := docker.RunContainer(gameName, game, devMode); err != nil {

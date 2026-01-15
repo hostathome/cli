@@ -138,6 +138,23 @@ func RunContainer(gameName string, game *registry.Game, devMode bool) error {
 
 	containerName := containerPrefix + gameName
 
+	// Create server directories (required for mounts to work)
+	absPath, err := filepath.Abs(fmt.Sprintf("./%s-server", gameName))
+	if err != nil {
+		return err
+	}
+
+	// Create mount directories to avoid "bind source path does not exist" errors
+	mountDirs := []string{
+		filepath.Join(absPath, "data"),
+		filepath.Join(absPath, "configs"),
+	}
+	for _, dir := range mountDirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create mount directory %s: %w", dir, err)
+		}
+	}
+
 	// Check if container already exists
 	containers, err := cli.ContainerList(ctx, container.ListOptions{
 		All:     true,
@@ -147,15 +164,36 @@ func RunContainer(gameName string, game *registry.Game, devMode bool) error {
 		return err
 	}
 
-	// If container exists, start it
+	// If container exists, check if mount paths are valid
 	if len(containers) > 0 {
 		c := containers[0]
 		if c.State == "running" {
 			fmt.Printf("Container %s is already running\n", containerName)
 			return nil
 		}
-		fmt.Printf("Starting existing container %s...\n", containerName)
-		return cli.ContainerStart(ctx, c.ID, container.StartOptions{})
+
+		// Check if mount paths exist
+		allMountsValid := true
+		for _, mount := range c.Mounts {
+			if mount.Type == "bind" {
+				if _, err := os.Stat(mount.Source); err != nil {
+					allMountsValid = false
+					break
+				}
+			}
+		}
+
+		// If all mounts are valid, start the container
+		if allMountsValid {
+			fmt.Printf("Starting existing container %s...\n", containerName)
+			return cli.ContainerStart(ctx, c.ID, container.StartOptions{})
+		}
+
+		// Mount paths don't exist - remove stale container and recreate
+		fmt.Printf("Container mount paths are invalid, recreating...\n")
+		if err := cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil {
+			return fmt.Errorf("failed to remove stale container: %w", err)
+		}
 	}
 
 	// In dev mode, skip image pull and verify local image exists
@@ -172,12 +210,6 @@ func RunContainer(gameName string, game *registry.Game, devMode bool) error {
 		if err := PullImage(game.Image); err != nil {
 			return fmt.Errorf("failed to pull image: %w", err)
 		}
-	}
-
-	// Create new container
-	absPath, err := filepath.Abs(fmt.Sprintf("./%s-server", gameName))
-	if err != nil {
-		return err
 	}
 
 	// Validate port mappings
