@@ -50,26 +50,17 @@ hostathome stop minecraft
 
 ### Modifying Configuration
 
+Edit configuration files directly in your server directory:
+
 ```bash
 # Edit server settings
-hostathome config minecraft
-# Prompts to restart after editing
+nano minecraft-server/configs/config.yaml
 
-# Edit mods
-hostathome mods minecraft
-# Prompts to restart after editing
-
-# Or manually restart
+# If you made changes, restart the server
 hostathome restart minecraft
-```
 
-### Updating
-
-The CLI automatically checks for updates once per day and notifies you when a new version is available:
-
-```bash
-# Update to the latest version
-hostathome update
+# View logs to confirm changes applied
+hostathome logs minecraft -f
 ```
 
 ### Cleanup Commands
@@ -86,19 +77,18 @@ hostathome uninstall minecraft
 
 | Command | Description |
 |---------|-------------|
-| `doctor` | Check system requirements (Docker, permissions, registry) |
-| `list` | List available games in the registry |
-| `install <game>` | Pull Docker image and create server directory |
+| `doctor` | Check system requirements (Docker, permissions, registry access) |
+| `list` | List available games from the registry |
+| `install <game>` | Pull Docker image and create server directory structure |
 | `run <game>` | Start the game server container |
 | `stop <game>` | Stop the running container |
 | `restart <game>` | Restart container to apply config/mod changes |
 | `remove <game>` | Remove container but keep data directory |
-| `uninstall <game>` | Remove container, image, and data (prompts for confirmation) |
-| `status [game]` | Show status of running servers |
-| `logs <game>` | View server logs (`-f` to follow, `-n` for line count) |
-| `config <game>` | Edit server configuration (prompts to restart) |
-| `mods <game>` | Edit mods configuration (prompts to restart) |
-| `update` | Update CLI to the latest version from GitHub releases |
+| `uninstall <game>` | Remove container, image, and data directory (prompts for confirmation) |
+| `status [game]` | Show status of all or specific running servers in table format |
+| `logs <game>` | View server logs (`-f` to follow, `-n <num>` for line count) |
+
+**Note:** Configuration editing is done by directly modifying files in `<game>-server/configs/config.yaml` and `<game>-server/configs/mods.yaml` (if present).
 
 ## Directory Structure
 
@@ -134,131 +124,129 @@ server:
 
 Run `hostathome doctor` to verify your system is ready.
 
-## Development
+## Architecture
 
-### Quick Development Workflow
+### How It Works
 
-```bash
-# Build and install dev version
-make build && sudo make install
+HostAtHome CLI is a Docker management wrapper written in Go that simplifies game server operations:
 
-# Or use this one-liner to uninstall current + install dev:
-sudo dpkg -r hostathome 2>/dev/null; make build && sudo make install
+1. **Registry System** - Fetches game definitions from a GitHub-hosted registry (YAML files)
+2. **Docker Integration** - Uses Docker SDK to manage container lifecycle
+3. **Configuration Mapping** - Containers convert `config.yaml` to game-specific formats via entrypoint scripts
+4. **Volume Management** - All server data stored in standardized directory structure
 
-# Test the dev version
-hostathome --version
-hostathome list
+### Components
+
+**cmd/hostathome/main.go** - Command definitions and CLI routing using Cobra framework
+
+**internal/docker/** - Docker SDK wrapper handling:
+- Image pulling with timeout (5 minutes)
+- Container creation with port mapping
+- Container lifecycle (start, stop, restart, remove)
+- Status queries and log retrieval
+- Automatic volume/directory creation
+
+**internal/registry/** - Registry management:
+- Fetches game definitions from `https://raw.githubusercontent.com/hostathome/registry/main`
+- Caches definitions locally for 1 hour
+- Validates game names to prevent path traversal attacks
+- Falls back to cache when offline
+
+**internal/ui/** - Terminal formatting:
+- Colored output with ASCII symbols
+- Animated spinners for long operations
+- Table formatting for status output
+- Graceful degradation for piped output
+
+**internal/config/** - Configuration management:
+- Cache directory: `~/.hostathome/cache/registry/`
+- Config directory: `~/.hostathome/`
+
+### Data Flow
+
+```
+hostathome install minecraft
+  ↓
+Fetches minecraft.yaml from registry
+  ↓
+Creates minecraft-server/ with save/, configs/, mods/, backup/, data/ directories
+  ↓
+Pulls Docker image: ghcr.io/hostathome/minecraft-server
+  ↓
+
+hostathome run minecraft
+  ↓
+Creates Docker container with:
+  - External ports: 30065 (players), 30066 (RCON)
+  - Mounted volume: ./minecraft-server/ → /data
+  - Labels for identification
+  ↓
+Container entrypoint:
+  1. Symlinks /data/* to internal paths
+  2. Reads config.yaml and converts to server.properties
+  3. Starts Minecraft server
 ```
 
-### Build Commands
+## Troubleshooting
 
+### Docker Not Found or Permission Denied
+
+**Error:** `permission denied while trying to connect to the Docker daemon`
+
+**Solution:** Add your user to the docker group (requires docker to be installed):
 ```bash
-# Build binary
-make build
-
-# Install locally (requires sudo)
-make install
-
-# Run tests
-make test
-
-# Build .deb package
-make deb
-
-# Build for all platforms
-make release
+sudo usermod -aG docker $USER
+# Log out and log back in, or run:
+newgrp docker
 ```
 
-### Development Tips
+### Registry Connection Issues
 
-**Hot reload during development:**
+**Error:** `failed to fetch registry` or `connection timeout`
+
+**Solution:**
+- Check internet connection: `ping github.com`
+- The CLI caches game definitions locally for 1 hour - offline mode will use cached data
+- Verify registry is accessible: `curl https://raw.githubusercontent.com/hostathome/registry/main/index.yaml`
+
+### Port Already in Use
+
+**Error:** `bind: address already in use`
+
+**Solution:**
 ```bash
-# Use the binary directly without installing
-make build
-./bin/hostathome list
+# Find what's using port 30065
+sudo lsof -i :30065
 
-# Or create an alias
-alias hah='./bin/hostathome'
-hah list
+# Stop the conflicting service or use different ports
+# (Modify port mappings in the game server implementation)
 ```
 
-**Testing changes:**
+### Container Crashes on Startup
+
+**Solution:**
+1. Check logs: `hostathome logs minecraft -f`
+2. Verify config.yaml format is valid YAML
+3. Ensure all required config keys are present
+4. Check Docker image was pulled successfully: `docker images | grep minecraft`
+
+### Stale Containers or Mount Issues
+
+**Solution:**
 ```bash
-# 1. Make code changes
-# 2. Rebuild
-make build
+# Remove container and data (careful!)
+hostathome remove minecraft
 
-# 3. Test without installing
-./bin/hostathome install minecraft
-
-# 4. When ready, install system-wide
-sudo make install
+# Recreate from scratch
+hostathome run minecraft
 ```
 
-## Development Mode
+### Check System Status
 
-### Testing Local Server Images
-
-When developing game server images, use the `--dev` flag to test without pulling from the registry:
-
+Always start troubleshooting with:
 ```bash
-# 1. Build your local image with :dev tag
-cd hostathome/servers/minecraft-server
-docker build -t minecraft-server:dev .
-
-# 2. Run using local image
-hostathome run minecraft --dev
-
-# 3. Make changes to config, entrypoint, or Python scripts
-# 4. Rebuild and restart
-docker build -t minecraft-server:dev .
-docker restart hostathome-minecraft
-
-# Or use the Makefile for convenience
-make rebuild
+hostathome doctor
 ```
 
-### The `--dev` Flag
+This checks Docker connectivity, permissions, and registry access.
 
-- Uses local `<game>-server:dev` image instead of pulling from registry
-- Useful for testing Docker image changes before pushing to production
-- Skips the image pull step, so changes are tested immediately
-- Requires the local image to exist first
-
-### Example Workflow
-
-```bash
-# Start with building the dev image
-cd hostathome/servers/minecraft-server
-make build
-
-# Start the server in dev mode
-cd /path/to/servers
-hostathome run minecraft --dev
-
-# Test configuration changes
-cat > minecraft-server/configs/mods.yaml <<EOF
-loader: vanilla
-modpack:
-  platform: curseforge
-  slug: "all-the-mods-9"
-  api-key: "your-key"
-mods: {}
-EOF
-
-# Quick rebuild and restart
-cd hostathome/servers/minecraft-server
-make rebuild
-
-# Check logs
-docker logs hostathome-minecraft -f
-```
-
-## Uninstallation
-
-To remove the CLI:
-```bash
-sudo dpkg -r hostathome
-```
-
-This removes the CLI but preserves any game server data you've created.

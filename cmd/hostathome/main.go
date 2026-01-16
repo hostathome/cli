@@ -185,8 +185,8 @@ var runCmd = &cobra.Command{
 				DisplayName: gameName + " (dev)",
 				Image:       gameName + "-server:dev",
 				Ports: registry.Ports{
-					Player: 1024,
-					RCON:   1025,
+					Player: 30065,
+					RCON:   30066,
 				},
 				InternalPorts: registry.Ports{
 					Player: 25565,
